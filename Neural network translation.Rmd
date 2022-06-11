@@ -1,0 +1,192 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+# loading the required libraries
+library(keras)
+library(stringr)
+library(reshape2)
+library(purrr)
+library(ggplot2)
+library(readr)
+library(stringi)
+```
+
+```{r}
+# loading the first 10000 phrases from the data;this will be our input data
+lines <- readLines("data/deu.txt", n = 10000)
+sentences <- str_split(lines, "\t")
+```
+
+```{r}
+#  cleaning the input data 
+data_cleaning <- function(sentence) {
+  sentence = gsub('[[:punct:] ]+',' ',sentence)
+  sentence = gsub("[^[:alnum:]\\-\\.\\s]", " ", sentence)
+  sentence = stringi::stri_trans_general(sentence, "latin-ascii")
+  sentence = tolower(sentence)
+#   sentence = paste0("<start> ", sentence, " <stop>")
+  sentence
+}
+sentences <- map(sentences,data_cleaning)
+```
+
+```{r}
+# capturing the maximum length of statements in English and German 
+english_sentences = list()
+german_sentences = list()
+
+for(i in 1:length(sentences)){
+    current_sentence <- sentences[i]%>%unlist()%>%str_split('\t')
+    english_sentences <- append(english_sentences,current_sentence[1])
+    german_sentences <- append(german_sentences,current_sentence[2])  
+}
+```
+
+```{r}
+# converting the data into a dataframe
+data <- do.call(rbind, Map(data.frame, "German"=german_sentences,"English"=english_sentences))
+```
+
+```{r}
+# checking the maximum number of words in all the sentences in German and English phrases
+german_length = max(sapply(strsplit(as.character(data[,"German"] ), " "), length))
+eng_length = max(sapply(strsplit(as.character(data[,"English"] ), " "), length))
+```
+
+```{r}
+# defining a function for tokenization
+tokenization <- function(lines){
+    tokenizer = text_tokenizer()
+    tokenizer =  fit_text_tokenizer(tokenizer,lines)
+    return(tokenizer)
+}
+
+```
+
+```{r}
+# preparing German tokenizer
+german_tokenizer = tokenization(data[,"German"])
+german_vocab_size = length(german_tokenizer$word_index)  + 1
+
+# preparing English tokenizer
+eng_tokenizer = tokenization(data[,"English"])
+eng_vocab_size = length(eng_tokenizer$word_index) + 1
+
+```
+
+```{r}
+# function to encode and pad sequences
+encode_pad_sequences <- function(tokenizer, length, lines){
+    # Encoding text to integers
+    seq = texts_to_sequences(tokenizer,lines)
+    # Padding text to maximum length sentence
+    seq = pad_sequences(seq, maxlen=length, padding='post')
+    return(seq)
+}
+```
+
+```{r}
+# dividing the data into training and testing datasets 
+train_data <- data[1:9000,]
+test_data <- data[9001:10000,]
+```
+
+```{r}
+# preprocessing the training and testing data
+x_train <- encode_pad_sequences(german_tokenizer,german_length,train_data[,"German"])
+y_train <- encode_pad_sequences(eng_tokenizer,eng_length,train_data[,"English"])
+y_train <- to_categorical(y_train,num_classes = eng_vocab_size)
+
+x_test <- encode_pad_sequences(german_tokenizer,german_length,test_data[,"German"])
+y_test <- encode_pad_sequences(eng_tokenizer,eng_length,test_data[,"English"])
+y_test <- to_categorical(y_test,num_classes = eng_vocab_size)
+```
+
+```{r}
+# defining network parameters for model
+in_vocab = german_vocab_size
+out_vocab = eng_vocab_size
+in_timesteps = german_length
+out_timesteps = eng_length
+units = 512
+epochs = 70
+batch_size = 200
+```
+
+
+```{r}
+# building model
+model <- keras_model_sequential()
+model %>%
+    layer_embedding(in_vocab,units, input_length=in_timesteps, mask_zero=TRUE) %>%
+    layer_lstm(units = units) %>%
+    layer_repeat_vector(out_timesteps)%>%
+    layer_lstm(units,return_sequences = TRUE)%>%
+    time_distributed(layer_dense(units = out_vocab, activation='softmax'))
+
+# compiling the model
+model %>% compile(optimizer = "adam",loss = 'categorical_crossentropy')
+
+# summary of the model
+summary(model)
+```
+
+```{r}
+# defining callbacks and checkpoints
+model_name <- "model_nmt"
+checkpoint_dir <- "checkpoints_nmt"
+dir.create(checkpoint_dir)
+filepath <- file.path(checkpoint_dir, paste0(model_name,"weights.{epoch:02d}-{val_loss:.2f}.hdf5",sep=""))
+
+cp_callback <- list(callback_model_checkpoint(mode = "min",
+ filepath = filepath,
+ save_best_only = TRUE,
+ verbose = 1))
+```
+
+```{r}
+# training the model
+model %>% fit(x_train,y_train,epochs = epochs,batch_size = batch_size,validation_split = 0.2,callbacks = cp_callback,verbose = 2)
+```
+
+```{r}
+# predicting for test data
+predicted = model %>% predict_classes(x_test)
+```
+
+```{r}
+# function to create a reversed list of key-value pair of the word index
+reverse_word_index <- function(tokenizer){
+    reverse_word_index <- names(tokenizer$word_index)
+    names(reverse_word_index) <- tokenizer$word_index
+    return(reverse_word_index)
+}
+
+german_reverse_word_index <- reverse_word_index(german_tokenizer)
+eng_reverse_word_index <- reverse_word_index(eng_tokenizer)
+```
+
+```{r}
+# decoding sample phrases from test data in German to English
+index_to_word <- function(data_sample,word_index_dict){
+    phrase = list()
+    for(i in 1:length(data_sample)){
+        index = data_sample[[i]]
+        word = word_index_dict[index] 
+        phrase = paste0(phrase," ",word)
+    }
+    return(phrase)
+
+}
+```
+
+```{r}
+
+```

@@ -1,0 +1,208 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+# importing required libraries
+library(keras)
+library(imager)
+library(graphics)
+```
+
+```{r}
+# loading the data
+labels <- read.csv('data/raccoon_dataset/raccoon_labels.csv')
+```
+
+```{r}
+# plotting a sample image with bounding box from the given coordinates in the data
+im <- load.image('data/raccoon_dataset/images/raccoon-1.jpg')
+im_info = labels[labels$filename == 'raccoon-1.jpg' ,]
+print(im_info)
+plot(im)
+rect(xleft = im_info$xmin ,ybottom = im_info$ymin,xright = im_info$xmax,ytop = im_info$ymax,border = "red",lwd = 1)
+```
+
+```{r}
+# fixing image width and height and initializing network parameters
+image_channels = 3
+batch_size = 15
+image_width_resized = 96
+image_height_resized = 96
+model_name = "raccoon_1_"
+```
+
+```{r}
+# rescaling the coordinates of the bounding box according to the new image dimensions
+labels$x_min_resized = (labels[,'xmin']/(labels[,'width']) * image_width_resized)%>% round()
+labels$y_min_resized = (labels[,'ymin']/(labels[,'height']) * image_height_resized)%>% round()
+labels$x_max_resized = (labels[,'xmax']/(labels[,'width']) * image_width_resized)%>% round()
+labels$y_max_resized = (labels[,'ymax']/(labels[,'height']) * image_height_resized)%>% round()
+```
+
+```{r}
+# displaying the resized version of the same example 
+x <-labels[labels$filename == 'raccoon-1.jpg',]
+im_resized <- resize(im = im,size_x = image_width_resized,size_y = image_height_resized)
+plot(im_resized)
+rect(xleft = x$x_min_resized,ybottom = x$y_min_resized,xright = x$x_max_resized ,ytop = x$y_max_resized,border = "red",lwd = 1)
+```
+
+
+```{r}
+# splitting the data into training,validation and test datasets
+X_train <- labels[1:150,]
+X_val <- labels[151:200,]
+X_test <- labels[201:nrow(labels),]
+```
+
+```{r}
+#  defining a function for calculating the custom metric for our model, i.e. intersection over union(IOU)
+metric_iou <- function(y_true, y_pred) {
+    
+  intersection_x_min_resized <- k_maximum(y_true[ ,1], y_pred[ ,1])
+  intersection_y_min_resized <- k_maximum(y_true[ ,2], y_pred[,2])
+  intersection_x_max_resized <- k_minimum(y_true[ ,3], y_pred[ ,3])
+  intersection_y_max_resized <- k_minimum(y_true[ ,4], y_pred[ ,4])
+  
+  area_intersection <- (intersection_x_max_resized - intersection_x_min_resized) * 
+                       (intersection_y_max_resized - intersection_x_max_resized)
+  area_y <- (y_true[ ,3] - y_true[ ,1]) * (y_true[ ,4] - y_true[ ,2])
+  area_yhat <- (y_pred[ ,3] - y_pred[ ,1]) * (y_pred[ ,4] - y_pred[ ,2])
+  area_union <- area_y + area_yhat - area_intersection
+  
+  iou <- area_intersection/area_union
+  k_mean(iou)
+
+}
+```
+
+```{r}
+# instantiating a VGG16 model with imagenet weights
+feature_extractor <- application_vgg16(include_top = FALSE,
+    weights = "imagenet",
+    input_shape = c(image_width_resized, image_height_resized,image_channels)
+)
+```
+
+```{r}
+# adding layers to VGG16 network and building model
+output <- feature_extractor$output %>%
+    layer_conv_2d(filters = 4,kernel_size = 3) %>%
+    layer_reshape(c(4))
+
+model <- keras_model(inputs = feature_extractor$input, outputs = output)
+# summary of the model
+summary(model)
+```
+
+```{r}
+#  freezing feature extractor part of the neural network
+freeze_weights(feature_extractor)
+
+# compiling the model
+model %>% compile(
+  optimizer = "adam",
+  loss = "mae",
+  metrics = list(custom_metric("iou", metric_iou))
+)
+```
+
+```{r}
+# creating a custom generator function to get batches of image data and corresponding resized bounding box coordinates on the fly
+localization_generator <-  function(data,target_height,target_width,batch_size) {
+    
+    function(){
+        indexes <- sample(1:nrow(data), batch_size, replace = TRUE)
+        y <- array(0, dim = c(length(indexes), 4))
+        x <- array(0, dim = c(length(indexes), target_height, target_width, 3))
+        for (j in 1:length(indexes)){
+            im_name = data[indexes[j],"filename"] %>% as.character()
+            im = load.image(file =paste0('data/raccoon_dataset/images/',im_name,sep = ""))
+            im = resize(im = im,size_x = target_width,size_y = target_height)
+            im = im[,,,]
+            x[j,,,] <- as.array(im)
+            y[j, ] <- data[indexes[j], c("x_min_resized","y_min_resized","x_max_resized","y_max_resized")] %>% as.matrix()
+        }
+        list(x, y)
+  }
+}
+```
+
+```{r}
+# creating a generator for training data using the function "localization_generator"
+train_generator = localization_generator(data = X_train,target_height = image_height_resized,target_width =image_width_resized,batch_size = batch_size  )
+# creating a generator for validation data using the function "localization_generator"
+validation_generator = localization_generator(data = X_val,target_height = image_height_resized,target_width =image_width_resized,batch_size = batch_size  )
+```
+
+```{r}
+# defining checkpoints and callbacks
+
+checkpoint_dir <- "checkpoints_raccoon"
+dir.create(checkpoint_dir)
+filepath <- file.path(checkpoint_dir, paste0(model_name,"weights.{epoch:02d}-{val_loss:.2f}-val_iou{val_iou:.2f}-iou{iou:.2f}.hdf5",sep=""))
+
+
+cp_callback <- list(callback_model_checkpoint(mode = "max",
+    filepath = filepath,
+    save_best_only = TRUE,
+    verbose = 1),
+    callback_early_stopping(patience = 100))
+```
+
+```{r}
+# training the model
+model %>% fit_generator(
+  train_generator,
+    validation_data = validation_generator,
+  epochs = 100,
+  steps_per_epoch = nrow(X_train) / batch_size,
+    validation_steps = nrow(X_val) / batch_size,
+    callbacks = cp_callback
+)
+```
+
+```{r}
+# saving the model
+model %>% save_model_hdf5(paste0(model_name,"obj_dect_raccoon.h5",sep=""))
+
+# loading a sample test image and preprocessing it similar to the training data images
+test <- X_test[1,]
+test_img <- load.image(paste(file = 'data/raccoon_dataset/images/',test$filename,sep = ""))
+```
+
+
+```{r}
+# resizing the sample image from test data
+test_img_resized <- resize(test_img,size_x = image_width_resized,size_y = image_width_resized)
+test_img_resized_mat = test_img_resized[,,,]
+
+# converting the resized image into an array
+test_img_resized_mat <- as.array(test_img_resized_mat)
+
+# reshaping the array
+test_img_resized_mat <- array_reshape(test_img_resized_mat,dim = c(1,image_width_resized,image_width_resized,image_channels))
+```
+
+```{r}
+# predicting coordinates of bounding box for the test sample
+predicted_cord <- model %>% predict(test_img_resized_mat)
+predicted_cord = abs(ceiling(predicted_cord))
+```
+
+```{r}
+# plotting the test image with both actual bounding box and the predicted bounding box
+plot(test_img_resized)
+rect(xleft = x$x_min_resized,ybottom = x$y_min_resized,xright = x$x_max_resized ,ytop = x$y_max_resized,border = "red",lwd = 1)
+rect(xleft = predicted_cord[1] ,ybottom = predicted_cord[2] ,xright = predicted_cord[3] + predicted_cord[1] ,ytop = predicted_cord[4] ,border = "green",lwd = 1)
+```
+
+```{r}
+
+```
