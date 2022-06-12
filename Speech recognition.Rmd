@@ -1,0 +1,251 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+# importing the required libraries
+library(seewave)
+library(stringr)
+library(keras)
+library(tuneR)
+library(splitstackshape)
+library(tensorflow)
+```
+
+```{r}
+# reading input file
+read_file <- function(name_wav){
+  wav_file = readWave(name_wav)
+}
+wav_file = read_file("data/data_speech_commands_v0.01/no/012c8314_nohash_0.wav")
+wav_file
+```
+
+```{r}
+
+
+get_attributes <-function(wav_file){
+  # accessing the attributes of the wave object
+  # sample
+  print(head(wav_file@left))
+  # sampling rate
+  print(paste("Sampling rate of the audio:", wav_file@samp.rate))
+  # num of samples
+  print(paste("Number of samples in the audio:",length(wav_file@left)))
+  # duration of audio
+  print(paste("Duration of audio is:",length(wav_file@left)/wav_file@samp.rate,"second"))
+}
+get_attributes(wav_file)
+```
+
+```{r}
+plott_wav <-function(wav_file){
+  # plotting the oscillogram of the sound wave 
+  # wave data
+  wave_data = wav_file@left
+  # Number of data samples
+  num_samples = length(wav_file@left)
+  # sampling rate of the wave
+  sampling_rate = wav_file@samp.rate
+  
+  # plot oscillogram
+  oscillo(wave = wav_file,f = sampling_rate)
+}
+plott_wav(wav_file)
+```
+
+```{r}
+plott_spectrogram <-function(wav_file){
+  # plotting the spectrogram
+  window_length = 512
+  overlap = 40
+  window_type = "hanning"
+  
+  # plot spectrogram
+  spectro(wav_file, f=sampling_rate, wl=512, ovlp=40, osc=TRUE,colgrid="white", colwave="white", colaxis="white", collab="white", colbg="black")
+}
+plott_spectrogram(wav_file)
+```
+
+```{r}
+# looking at the structure of the values returned by the spectro() function
+stft_wave = spectro(wave_data,f = sampling_rate,wl = window_length,ovlp = overlap,wn = window_type,complex = T,plot = F,dB = NULL,norm = F)
+str(stft_wave)
+```
+
+```{r}
+# listing all the files inside dataspeech_commands_v0.01_ folder
+files = list.files("data/data_speech_commands_v0.01",all.files = T,full.names = F,recursive = T)
+
+paste("Number audio files in datase: ",length(files))
+
+file_df = as.data.frame(files)
+head(file_df)
+```
+
+```{r}
+# creating a data frame which contains file names and respective class label
+file_df$class = str_split_fixed(file_df$files,pattern = "/",n = 2)[,1]
+file_df <- file_df[sample(nrow(file_df)),]
+rownames(file_df) <- NULL
+file_df = file_df[file_df$class %in% c("bird","no","off"),]
+file_df$files <- as.character(file_df$files)
+file_df$class <- as.numeric(as.factor(file_df$class)) -1
+rownames(file_df) <- NULL
+head(file_df)
+```
+
+```{r}
+# fft size
+fft_size = window_length/2
+# creating a variable to set the number of unique labels
+num_speech_labels = length(unique(file_df$class))
+```
+
+```{r}
+# split data into train, test and validation
+set.seed(200)
+train_index = stratified(file_df,group = "class",.80,keep.rownames = T)$rn
+test_index = setdiff(row.names(file_df),train_index)
+val_index = stratified(file_df[train_index,],group = "class",.20,keep.rownames = T)$rn
+
+train_data = file_df[setdiff(train_index,val_index),]
+test_data = file_df[test_index,]
+val_data = file_df[val_index,]
+```
+
+```{r}
+# shuffle train and test data
+test_data = test_data[sample(nrow(test_data)),]
+train_data = train_data[sample(nrow(train_data)),]
+```
+
+```{r}
+# building model to classify audio samples
+model <- keras_model_sequential()
+model %>%  
+  layer_conv_2d(input_shape = c(fft_size, num_fft_windows,1), 
+                filters = 32, kernel_size = c(3,3), activation = 'relu') %>% 
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>% 
+  layer_conv_2d(filters = 64, kernel_size = c(3,3), activation = 'relu') %>% 
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>% 
+  layer_dropout(rate = 0.25) %>% 
+  layer_flatten() %>% 
+  layer_dense(units = 128, activation = 'tanh') %>% 
+  layer_dense(units = num_speech_labels, activation = 'softmax')
+```
+
+```{r}
+# compiling the model
+model %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = "rmsprop",
+  metrics = c('accuracy')
+)
+# visualising the summary of the model
+summary(model)
+```
+
+```{r}
+# building data generator
+data_generator <-  function(data,windowlen,overlap,numfftwindows,fftsize,windowtype,num_classes,batchsize) {
+    
+    function(){
+        indexes <- sample(1:nrow(data), batchsize, replace = TRUE)
+        x <- array(0, dim = c(length(indexes),fftsize, numfftwindows,1))
+        y <- array(0, dim = c(length(indexes)))
+        
+        for (j in 1:length(indexes)){
+            wav_file_name = data[indexes[j],"files"]  %>% as.character()
+            wav_file = readWave(paste0("data/data_speech_commands_v0.01/",wav_file_name))
+            # wave attributes
+            wave_data = wav_file@left
+            num_samples = length(wav_file@left)
+            sampling_rate = wav_file@samp.rate
+            # accomodating varying input lengths            
+            if(num_samples < 16000){
+                zero_pad = rep(0,16000 - length(wave_data))
+                wave_data = c(wave_data,zero_pad)
+            }else if(num_samples > 16000){
+                wave_data = wave_data[1:16000]
+            }
+            # spectrogram representaion
+            spectrogram_data = spectro(wave_data,f = sampling_rate ,wl = windowlen,ovlp = overlap,wn = windowtype,complex = T,plot = F,dB = NULL,norm = F)
+            spectrogram_data = spectrogram_data$amp
+            spectrogram_data = Mod(spectrogram_data)
+            
+            # imputing NaN and Inf
+            if((sum(is.nan(spectrogram_data))> 0)){
+                spectrogram_data[which(is.nan(spectrogram_data))] =  log(0.01)
+            }else if((sum(is.infinite(spectrogram_data)) >0)){
+                spectrogram_data[which(is.infinite(spectrogram_data))] =  log(0.01)
+            }else if((sum(is.infinite(spectrogram_data)) >0)){
+                spectrogram_data[which(is.na(spectrogram_data))] =  log(0.01)
+            }
+                
+            spectrogram_data = array_reshape(spectrogram_data,dim = c(fftsize,numfftwindows,1))
+            
+            x[j,,,] =  spectrogram_data
+            y[j] = data[indexes[j],c("class")] %>% as.matrix()
+          }
+          list(x, to_categorical(y,num_classes = num_classes))
+    }
+  }
+```
+
+```{r}
+# creating train and validation generators
+batch_size = 20
+epochs = 2
+
+# train and validation generator
+train_generator = data_generator(data = train_data,windowlen = window_length,overlap = overlap,numfftwindows = num_fft_windows,fftsize = fft_size, windowtype = window_type,num_classes = num_speech_labels,batchsize = batch_size)
+val_generator = data_generator(data = val_data,windowlen = window_length,overlap = overlap,numfftwindows = num_fft_windows,fftsize = fft_size, windowtype = window_type,num_classes = num_speech_labels,batchsize = batch_size)
+
+```
+
+```{r}
+# defining model callbacks
+model_name = "speech_rec_"
+
+checkpoint_dir <- "checkpoints_speech_recognition"
+dir.create(checkpoint_dir)
+filepath <- file.path(checkpoint_dir, paste0(model_name,"weights.{epoch:02d}-{val_loss:.2f}.hdf5",sep=""))
+
+cp_callback <- list(callback_model_checkpoint(mode = "auto",
+    filepath = filepath,
+    save_best_only = TRUE,
+    verbose = 1),
+    callback_early_stopping(min_delta = 0.05,patience = 10))
+```
+
+```{r}
+# training the model
+model %>% fit_generator(generator = train_generator,
+                        epochs = epochs,
+                        steps_per_epoch = nrow(train_data)/batch_size,
+                        validation_data = val_generator ,
+                        validation_steps = nrow(val_data)/batch_size,
+                        callbacks = cp_callback
+)
+```
+
+```{r}
+# predicting class for a sample from test data
+test = readWave("data/data_speech_commands_v0.01/no//0132a06d_nohash_2.wav")
+# matrix corresponding to the amplitude values
+test = spectro(test,wl = window_length,ovlp = overlap,wn = "hanning",complex = T,plot = F,dB = NULL,norm = F)
+test = test$amp
+test = array_reshape(test,dim = c(fft_size,num_fft_windows,1))
+# predict label of test sample.
+model %>% predict_classes( array_reshape(test,dim = c(1,fft_size,num_fft_windows,1)))
+```
+
+```{r}
+
+```

@@ -1,0 +1,341 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+# importing the required libraries
+library(textclean)
+library(keras)
+library(stringr)
+library(tm)
+library(qdap)
+```
+
+```{r}
+# loading required columns from input data
+read_csv <- function(name_csv){
+  reviews <- read.csv(name_csv,nrows = 10000)[,c('Text', 'Summary')]
+}
+reviews = read_csv("data/Reviews.csv")
+head(reviews)
+```
+
+```{r}
+# keeping only those rows which have both text and summary information in the data
+reviews <- reviews[complete.cases(reviews),]
+rownames(reviews) <- 1:nrow(reviews)
+
+# converting the Text and Summary columns to character datatypes
+reviews$Text <- as.character(reviews$Text)
+reviews$Summary <- as.character(reviews$Summary)
+```
+
+```{r}
+# cleaning data
+clean_data <- function(data,remove_stopwords = TRUE){
+ data <- tolower(data)
+ data = replace_contraction(data)
+ data = gsub('<br />', '', data)
+ data = gsub('[[:punct:] ]+',' ',data)
+ data = gsub("[^[:alnum:]\\-\\.\\s]", " ", data)
+ data = gsub('&amp;', '', data)
+ data = if(remove_stopwords == "TRUE"){paste0(unlist(rm_stopwords(data,tm::stopwords("english"))),collapse = " ")}else{data}
+ data = gsub('\\.', "", data)
+ data = gsub('\\s+', " ", data)
+ return(data)
+
+}
+
+cleaned_text <- unlist(lapply(reviews$Text,clean_data,remove_stopwords = TRUE))
+cleaned_summary <- unlist(lapply(reviews$Summary,clean_data,remove_stopwords = FALSE))
+
+# Adding cleaned reviews and their summaries in a dataframe
+cleaned_reviews <- data.frame("Cleaned_Text"= cleaned_text,"Cleaned_Summary"= cleaned_summary)
+
+# Converting the Text and Summary columns to character datatypes
+cleaned_reviews$Cleaned_Text <- as.character(cleaned_reviews$Cleaned_Text)
+cleaned_reviews$Cleaned_Summary <- as.character(cleaned_reviews$Cleaned_Summary)
+head(cleaned_reviews)
+```
+
+```{r}
+# putting start and end tokens to signal the start and end of the sequences respectively in the summary
+cleaned_reviews[,"Cleaned_Summary"] <- sapply(X = cleaned_reviews[,2],FUN = function(X){paste0("<start> ",X," <end>")})
+```
+
+```{r}
+# fixing the maximum length of the reviews and the summary sequences
+max_length_text = 110
+max_length_summary = 10
+```
+
+```{r}
+# function for tokenization
+tokenization <- function(lines){
+    tokenizer = text_tokenizer()
+    tokenizer =  fit_text_tokenizer(tokenizer,lines)
+    return(tokenizer)
+}
+```
+
+```{r}
+# preparing a tokenizer on text data and calculating the vocabulary size of the text data
+x_tokenizer <- tokenization(cleaned_reviews$Cleaned_Text)
+x_voc_size   =  length(x_tokenizer$word_index) +1
+# preparing a tokenizer on summary data and calculating the vocabulary size of the summary data
+y_tokenizer <- tokenization(cleaned_reviews$Cleaned_Summary)
+y_voc_size   =  length(y_tokenizer$word_index) +1
+```
+
+```{r}
+# function for encoding and padding the sequences
+encode_pad_sequences <- function(tokenizer, length, lines){
+    # Encoding text to integers
+    seq = texts_to_sequences(tokenizer,lines)
+    # Padding text to maximum length sentence
+    seq = pad_sequences(seq, maxlen=length, padding='post')
+    return(seq)
+}
+```
+
+```{r}
+# splitting the data into training and testing datasets
+sample_size <- floor(0.80 * nrow(cleaned_reviews))
+## set the seed to make the partition reproducible
+set.seed(0)
+train_indices <- sample(seq_len(nrow(cleaned_reviews)), size = sample_size)
+x_train <- cleaned_reviews[train_indices,"Cleaned_Text"]
+y_train <- cleaned_reviews[train_indices,"Cleaned_Summary"]
+x_val <- cleaned_reviews[-train_indices,"Cleaned_Text"]
+y_val <- cleaned_reviews[-train_indices,"Cleaned_Summary"]
+```
+
+```{r}
+
+# encoding the training and validation datasets into integer sequences and padding them to their respective maximum lengths
+num_train_examples = length(x_train)
+num_val_examples = length(x_val)
+x <- encode_pad_sequences(x_tokenizer,max_length_text,x_train)
+x_val <- encode_pad_sequences(x_tokenizer,max_length_text,x_val)
+
+y_encoded <- encode_pad_sequences(y_tokenizer,max_length_summary,y_train)
+y1 <- encode_pad_sequences(y_tokenizer,max_length_summary,y_train)[,-max_length_summary]
+y2 <- encode_pad_sequences(y_tokenizer,max_length_summary,y_train)[,-1]
+y2 <- array_reshape(x = y2,c(num_train_examples,(max_length_summary-1),1))
+
+y_val_encoded <- encode_pad_sequences(y_tokenizer,max_length_summary,y_val)
+y_val1 <- encode_pad_sequences(y_tokenizer,max_length_summary,y_val)[,-max_length_summary]
+y_val2 <- encode_pad_sequences(y_tokenizer,max_length_summary,y_val)[,-1]
+y_val2 <- array_reshape(x = y_val2,c(num_val_examples,(max_length_summary-1),1))
+```
+
+```{r}
+# initializing parameters that will be fed in model configuration
+latent_dim = 500
+batch_size = 200
+epochs = 100
+```
+
+```{r}
+# Encoder configuration
+# Defining and processing the input sequence.
+encoder_inputs  <- layer_input(shape=c(max_length_text),name = "encoder_inputs")
+embedding_encoder <- encoder_inputs %>% layer_embedding(input_dim = x_voc_size,output_dim = latent_dim,trainable = TRUE,name = "encoder_embedding")
+
+# Encoder LSTM 1
+encoder_lstm1 <- layer_lstm(units=latent_dim,return_sequences = TRUE, return_state=TRUE,name = "encoder_lstm1")
+encoder_results1 <- encoder_lstm1(embedding_encoder)
+encoder_output1 <- encoder_results1[1]
+state_h1 <- encoder_results1[2]
+state_c1 <- encoder_results1[3]
+
+# Encoder LSTM 2
+encoder_lstm2 <- layer_lstm(units=latent_dim,return_sequences = TRUE, return_state=TRUE,name = "encoder_lstm2")
+encoder_results2 <- encoder_lstm2(encoder_output1)
+encoder_output2 <- encoder_results2[1]
+state_h2 <- encoder_results2[2]
+state_c2 <- encoder_results2[3]
+
+# Encode LSTM 3
+encoder_lstm3 <- layer_lstm(units=latent_dim,return_sequences = TRUE, return_state=TRUE,name = "encoder_lstm3")
+encoder_results3 <- encoder_lstm3(encoder_output2)
+encoder_outputs <- encoder_results3[1]
+state_h <- encoder_results3[2]
+state_c <- encoder_results3[3]
+encoder_states <- encoder_results3[2:3]
+```
+
+```{r}
+# Decoder configuration
+
+# Setting up the decoder, using encoder_states as the initial state
+decoder_inputs  <- layer_input(shape=list(NULL),name = "decoder_inputs")
+
+embedding_layer_decoder <- layer_embedding(input_dim = y_voc_size,output_dim = latent_dim,trainable = TRUE,name = "decoder_embedding")
+embedding_decoder <- embedding_layer_decoder(decoder_inputs)
+
+decoder_lstm    <- layer_lstm(units=latent_dim, return_sequences=TRUE,return_state=TRUE,name="decoder_lstm")
+decoder_results <- decoder_lstm(embedding_decoder, initial_state=encoder_states)
+decoder_outputs <- decoder_results[1]
+decoder_fwd_state <- decoder_results[2]
+decoder_back_state <- decoder_results[3]
+
+decoder_dense <- time_distributed(layer = layer_dense(units = y_voc_size, activation='softmax'))
+decoder_outputs <- decoder_dense(decoder_outputs[[1]])
+```
+
+```{r}
+# combining the encoder and decoder into a single model
+model <- keras_model(inputs = c(encoder_inputs, decoder_inputs),outputs = decoder_outputs)
+# compiling the model
+model %>% compile(optimizer = "rmsprop",loss = 'sparse_categorical_crossentropy')
+summary(model)
+```
+
+```{r}
+# defining the callbacks and checkpoints
+model_name <- "model_TextSummarization"
+
+# Checkpoints
+checkpoint_dir <- "checkpoints_text_summarization"
+dir.create(checkpoint_dir)
+filepath <- file.path(checkpoint_dir, paste0(model_name,"weights.{epoch:02d}-{val_loss:.2f}.hdf5",sep=""))
+
+# Callback
+ts_callback <- list(callback_model_checkpoint(mode = "min",
+ filepath = filepath,
+ save_best_only = TRUE,
+ verbose = 1,
+ callback_early_stopping(patience = 100)))
+```
+
+```{r}
+# training the model
+model %>% fit(x = list(x,y1),y = y2,epochs = epochs,batch_size = batch_size,validation_data = list(list(x_val,y_val1),y_val2),callbacks = ts_callback,verbose = 2)
+```
+
+```{r}
+# Generating predictions for test data
+# creating a function to generate a reversed list of key-value pair of the word index
+reverse_word_index <- function(tokenizer){
+    reverse_word_index <- names(tokenizer$word_index)
+    names(reverse_word_index) <- tokenizer$word_index
+    return(reverse_word_index)
+}
+x_reverse_word_index <- reverse_word_index(x_tokenizer)
+y_reverse_word_index <- reverse_word_index(y_tokenizer)
+# Reverse-lookup token index to decode sequences back to meaningful sentences or phrases
+reverse_target_word_index=y_reverse_word_index
+reverse_source_word_index=x_reverse_word_index
+target_word_index= y_tokenizer$word_index
+```
+
+```{r}
+# Inference model to decode unknown input sequences
+encoder_model <-  keras_model(inputs = encoder_inputs, outputs = encoder_results3)
+decoder_state_input_h <- layer_input(shape=latent_dim)
+decoder_state_input_c <- layer_input(shape=latent_dim)
+decoder_hidden_state_input <- layer_input(shape = c(max_length_text,latent_dim))
+decoder_embedding2 <- embedding_layer_decoder(decoder_inputs)
+decoder_results2 <- decoder_lstm(decoder_embedding2,initial_state = c(decoder_state_input_h,decoder_state_input_c))
+decoder_outputs2 <- decoder_results2[1]
+state_h2 <- decoder_results2[2]
+state_c2 <- decoder_results2[3]
+
+decoder_outputs2 <- decoder_dense(decoder_outputs2[[1]])
+inp = c(decoder_hidden_state_input,decoder_state_input_h,decoder_state_input_c)
+dec_states = c(state_h2,state_c2)
+decoder_model <-  keras_model(inputs = c(decoder_inputs,inp),outputs = c(decoder_outputs2,dec_states))
+```
+
+```{r}
+# defining a function decode_sequence(), which is the implementation of the inference process
+
+decode_sequence <- function(input_seq) {
+    ## Encoding the input as state vectors
+    encoder_predict <- predict(encoder_model, input_seq)
+    e_out = encoder_predict[[1]]
+    e_h = encoder_predict[[2]]
+    e_c = encoder_predict[[3]]
+
+    # Generating empty target sequence of length 1
+    target_seq <- array(0,dim = c(1,1))
+
+    ## Populating the first character of target sequence with the start character.
+    target_seq[1,1] <- target_word_index[['start']]
+
+    stop_condition = FALSE
+    decoded_sentence = ''
+    niter = 1
+    while (stop_condition==FALSE) {
+
+        decoder_predict <- predict(decoder_model, list(target_seq, e_out,e_h,e_c))
+        output_tokens <- decoder_predict[[1]]
+        h <-  decoder_predict[[2]]
+        c <-  decoder_predict[[3]]
+
+
+        ## Sampling a token
+        sampled_token_index <- which.max(output_tokens[1, 1, ])
+        sampled_token <- reverse_target_word_index[sampled_token_index]
+
+         if (sampled_token != 'end'){
+             decoded_sentence =  paste0(decoded_sentence, sampled_token," ")
+             if(sapply(strsplit(decoded_sentence, " "), length) >= max_length_summary){
+                 stop_condition = TRUE
+             }
+         }
+
+        target_seq <- array(0,dim = c(1,1))
+        target_seq[ 1,1] <- sampled_token_index
+
+        e_h = h
+        e_c = c
+
+  }
+    return(decoded_sentence)
+}
+```
+
+```{r}
+# defining functions to convert an integer sequence to a word sequence for both reviews and the summaries
+
+seq2summary<- function(input_seq){
+    newString=''
+    for(i in input_seq){
+        if((i!=0 & i!=target_word_index[['start']]) & i!=target_word_index[['end']]){
+        newString=paste0(newString,reverse_target_word_index[[i]],' ')
+        }
+        }
+     return(newString)
+}
+
+seq2text <- function(input_seq){
+    newString=''
+    for(i in input_seq){
+      if(i!=0){
+        newString=paste0(newString,reverse_source_word_index[[i]],' ')
+          }
+        }
+    return(newString)
+}
+```
+
+```{r}
+# decoding sample reviews
+for(i in 1:dim(x_val)[1]){
+    print(paste0("Review:",seq2text(x_val[i,])))
+    print(paste0("Original summary:",seq2summary(y_val_encoded[i,])))
+    print(paste0("Predicted summary:",decode_sequence(array_reshape(x_val[i,],dim= c(1,max_length_text)))))
+    print("\n")
+}
+```
+
+```{r}
+
+```
